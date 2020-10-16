@@ -1,0 +1,6 @@
+{:paths ["src"]
+ :deps
+ {reagent {:mvn/version "0.10.0"}
+  hiccup {:mvn/version "2.0.0-alpha2"}
+  }
+ }
