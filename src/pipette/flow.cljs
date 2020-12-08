@@ -3,7 +3,8 @@
   a name in a global database, so you can have more than one at a time."
   (:require [goog.async.nextTick]
             [reagent.ratom :refer [IDisposable]]
-            [reagent.core]))
+            [reagent.core]
+            [clojure.walk :as walk]))
 
 (defprotocol IView
   (view
@@ -21,7 +22,9 @@ can itself depend on other views by asking for them")
     [t f x y]
     [t f x y z]
     "Like view, except the function is called with @this, so cannot ask for more views")
-  )
+
+  (subscribe [t v]
+    "Like view or view*, except the arguments are determined from the meta on v, and the result is dereffed"))
 
 (defprotocol IHandler
   "A reference type for doing a reactive type web thing"
@@ -31,7 +34,7 @@ can itself depend on other views by asking for them")
 
 (declare cache-view!)
 
-(deftype View [reaction ^:mutable views]
+(deftype View [name reaction ^:mutable views]
   IView
   (view  [t f]          (cache-view! t false f))
   (view  [t f x]        (cache-view! t false f x))
@@ -43,6 +46,8 @@ can itself depend on other views by asking for them")
   (view*  [t f x y]     (cache-view! t true f x y))
   (view*  [t f x y z]   (cache-view! t true f x y z))
 
+  (subscribe [t f] @(cache-view! t :sub f))
+  
   IDeref
   (-deref [_] (deref reaction))
   
@@ -52,49 +57,78 @@ can itself depend on other views by asking for them")
 
   IDisposable
   (reagent.ratom/dispose! [this] (reagent.ratom/dispose! reaction))
-  (reagent.ratom/add-on-dispose! [this f] (reagent.ratom/add-on-dispose! reaction f)))
+  (reagent.ratom/add-on-dispose! [this f] (reagent.ratom/add-on-dispose! reaction f))
+
+  Object
+  (toString [this] (str "View on: " name)))
 
 (defn- cache-view! [view deref? f & args]
-  (let [key [deref f args]]
-    (or (get (.-views view) key)
+  (let [key [deref f args]
+        value (get (.-views view) key)]
+    (if value
+      value
 
-        (let [reaction (reagent.ratom/make-reaction
-                        (let [[x y z] args]
-                          (case (count args)
-                            0
-                            (if deref?
-                              ;; TODO remove apply here
-                              #(f (deref view))
-                              #(f view))
-                            1
-                            (if deref?
-                              ;; TODO remove apply here
-                              #(f (deref view) x)
-                              #(f view x))
-                            2
-                            (if deref?
-                              ;; TODO remove apply here
-                              #(f (deref view) x y)
-                              #(f view x y))
-                            3
-                            (if deref?
-                              ;; TODO remove apply here
-                              #(f (deref view) x y z)
-                              #(f view x y z))
-                            
-                            (if deref?
-                              ;; TODO remove apply here
-                              #(apply f (deref view) args)
-                              #(apply f view args)))))
-              subview (View. reaction {})
-              ]
-          (reagent.ratom/add-on-dispose!
-           reaction
-           (fn [_] (set! (.-views view)
-                         (dissoc (.-views view) key))))
-          
-          (set! (.-views view) (assoc (.-views view) key subview))
-          subview))))
+      (let [reaction
+            (let [[x y z] args]
+              (case (count args)
+                0
+                (case deref?
+                  true #(f (deref view))
+                  false #(f view)
+                  :sub
+                  (let [m (meta f)]
+                    (if (contains? m ::args)
+                      (let [m  (::args m)
+                            a  (map
+                                #(if (or (seq? %) (vector? %))
+                                   (apply cache-view! view :sub %)
+                                   (cache-view! view :sub %))
+                                m)]
+                        (case (count a)
+                          0 f
+                          1 (let [[a] a] #(f @a))
+                          2 (let [[a b] a] #(f @a @b))
+                          3 (let [[a b c] a] #(f @a @b @c))
+                          4 (let [[a b c d] a] #(f @a @b @c @d))
+                          5 (let [[a b c d e] a] #(f @a @b @c @d @e))
+                          #(apply f (map deref a))))
+                      
+                      (cache-view! view true f))))
+                
+                1
+                (case deref?
+                  (:sub true) #(f (deref view) x)
+                  false #(f view x))
+                2
+                (case deref?
+                  ("sub" true) #(f (deref view) x y)
+                  false #(f view x y))
+                3
+                (case deref?
+                  (:sub true) #(f (deref view) x y z)
+                  false #(f view x y z))
+                
+                (case deref?
+                  (:sub true) #(apply f (deref view) args)
+                  false #(apply f view args))))
+            
+            reaction (if (fn? reaction)
+                       (reagent.ratom/make-reaction reaction)
+                       reaction)
+            subview (View.
+                     (str f args)
+                     reaction {})
+            ]
+        
+        (reagent.ratom/add-on-dispose!
+         reaction
+         (fn [_]
+           (set! (.-views view)
+                 (dissoc (.-views view) key))))
+        
+        (set! (.-views view) (assoc (.-views view) key subview))
+        subview)
+      )))
 
 (deftype Root [state effects handler v ^:mutable events]
   IView
@@ -107,6 +141,8 @@ can itself depend on other views by asking for them")
   (view*  [t f x]        (view* v f x))
   (view*  [t f x y]      (view* v f x y))
   (view*  [t f x y z]    (view* v f x y z))
+
+  (subscribe [t f]       (subscribe v f))
 
   IDeref
   (-deref [_] (deref state))
@@ -131,7 +167,7 @@ can itself depend on other views by asking for them")
       (let [[new-state fx]
             (loop [state @state
                    to-run to-run
-                   fx nil]
+                   fx []]
               (if (empty? to-run)
                 [state fx]
                 (let [out (handler state (first to-run))]
@@ -174,6 +210,40 @@ can itself depend on other views by asking for them")
    state
    effects
    handler
-   (View. state {})
+   (View. "ROOT" state {})
    #queue []))
 
+
+(defn- event? [e]
+  (boolean
+   (or (instance? js/Event e)
+       (and (instance? js/Object e)
+            (.-nativeEvent e)))))
+
+(deftype Callback [root func e]
+  IFn
+  (-invoke [this]
+    (func
+     root
+     (walk/prewalk-replace {:% nil} e)))
+  
+  (-invoke [this el]
+    (func
+     root
+     (walk/prewalk-replace
+      {:% (if (event? el)
+            (-> el .-target .-value)
+            el)}
+      e)))
+
+  IEquiv
+  (-equiv [x y]
+    (and (instance? Callback y)
+         (= e (.-e y))
+         (= func (.-func y))
+         (= root (.-root y)))))
+
+(defn callback [root event & {:keys [immediate]}]
+  (Callback. root
+             (if immediate fire!! fire!)
+             event))
